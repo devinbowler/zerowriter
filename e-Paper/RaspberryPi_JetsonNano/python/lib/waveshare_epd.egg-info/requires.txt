@@ -1,3 +1,2 @@
+Jetson.GPIO
 Pillow
-RPi.GPIO
-spidev

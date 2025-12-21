@@ -30,6 +30,7 @@ lib/waveshare_epd/epd2in9d.py
 lib/waveshare_epd/epd3in0g.py
 lib/waveshare_epd/epd3in52.py
 lib/waveshare_epd/epd3in7.py
+lib/waveshare_epd/epd3in7_bu.py
 lib/waveshare_epd/epd4in01f.py
 lib/waveshare_epd/epd4in2.py
 lib/waveshare_epd/epd4in2b_V2.py

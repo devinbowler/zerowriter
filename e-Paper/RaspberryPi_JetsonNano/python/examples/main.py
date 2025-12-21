@@ -4,21 +4,21 @@
 # This code is open-source. Feel free to modify and redistribute as you want.
 # Participate on reddit in r/zerowriter if you want.
 #
-# Using the new4in2part library
+# Using the new4in26part library
 #
 # a python e-typewriter using eink and a USB keyboard
 # this program outputs directly to the SPI eink screen, and is driven by a
 # raspberry pi zero (or any pi). technically, it operates headless as the OS has no
 # access to the SPI screen. it handles keyboard input directly via keyboard library.
 #
-# currently ONLY supports waveshare 4in2
+# currently supports waveshare 4.26"
 #
 
 import time
 import keyboard
 import keymaps
 from PIL import Image, ImageDraw, ImageFont
-from waveshare_epd import new4in2part
+import new4in26part
 import textwrap
 import subprocess
 import signal
@@ -28,7 +28,7 @@ from pathlib import Path
 
 # Initialize the e-Paper display
 # clear refreshes whole screen, should be done on slow init()
-epd = new4in2part.EPD()
+epd = new4in26part.EPD()
 epd.init()
 epd.Clear()
 
@@ -38,10 +38,10 @@ display_draw = ImageDraw.Draw(display_image)
 
 #Display settings like font size, spacing, etc.
 display_start_line = 0
-font24 = ImageFont.truetype('Courier Prime.ttf', 18) #24
+font24 = ImageFont.truetype('Courier Prime.ttf', 32)  # Bigger font for 4.26"
 textWidth=16
-linespacing = 22
-chars_per_line = 32 #28
+linespacing = 38  # More space between lines
+chars_per_line = 40  # Slightly reduced to prevent spillover
 lines_on_screen = 12
 last_display_update = time.time()
 
@@ -102,24 +102,23 @@ def update_display():
     global scrollindex
     
     # Clear the main display area -- also clears input line (270-300)
-    display_draw.rectangle((0, 0, 400, 300), fill=255)
+    display_draw.rectangle((0, 0, 800, 480), fill=255)
     
     # Display the previous lines
-    y_position = 270 - linespacing  # leaves room for cursor input
+    y_position = 440 - linespacing  # leaves room for cursor input
 
     #Make a temp array from previous_lines. And then reverse it and display as usual.
     current_line=max(0,len(previous_lines)-lines_on_screen*scrollindex)
     temp=previous_lines[current_line:current_line+lines_on_screen]
-    #print(temp)# to debug if you change the font parameters (size, chars per line, etc)
 
     for line in reversed(temp[-lines_on_screen:]):
-       display_draw.text((10, y_position), line[:max_chars_per_line], font=font24, fill=0)
+       display_draw.text((10, y_position), line[:chars_per_line], font=font24, fill=0)
        y_position -= linespacing
 
     #Display Console Message
     if console_message != "":
-        display_draw.rectangle((300, 270, 400, 300), fill=255)
-        display_draw.text((300, 270), console_message, font=font24, fill=0)
+        display_draw.rectangle((650, 440, 800, 480), fill=255)
+        display_draw.text((650, 440), console_message, font=font24, fill=0)
         console_message = ""
     
     #generate display buffer for display
@@ -139,13 +138,13 @@ def update_input_area(): #this updates the input area of the typewriter (active 
     global updating_input_area
 
     cursor_index = cursor_position
-    display_draw.rectangle((0, 270, 400, 300), fill=255)  # Clear display
+    display_draw.rectangle((0, 440, 800, 480), fill=255)  # Clear input area
     
     #add cursor
     temp_content = input_content[:cursor_index] + "|" + input_content[cursor_index:]
     
     #draw input line text
-    display_draw.text((10, 270), str(temp_content), font=font24, fill=0)
+    display_draw.text((10, 440), str(temp_content[:chars_per_line]), font=font24, fill=0)
     
     #generate display buffer for input line
     updating_input_area = True
@@ -219,6 +218,118 @@ def handle_key_press(e):
         console_message = ""
         update_display()
 
+    #full refresh to clear ghosting via ctrl + r
+    if e.name== "r" and control_active:
+        # Unhook keyboard temporarily
+        keyboard.unhook_all()
+        
+        epd.init()  # Re-init with slow LUT
+        epd.Clear()  # Full clear
+        time.sleep(1)
+        
+        epd.init_Partial()  # Back to fast mode
+        needs_display_update = True
+        
+        # Re-hook keyboard
+        keyboard.on_press(handle_key_down, suppress=False)
+        keyboard.on_release(handle_key_press, suppress=True)
+
+    #view wifi networks via ctrl + w
+    if e.name== "w" and control_active:
+        # Unhook keyboard temporarily
+        keyboard.unhook_all()
+        
+        # Scan for networks
+        result = subprocess.run(['sudo', 'iwlist', 'wlan0', 'scan'], capture_output=True, text=True)
+        networks = []
+        
+        for line in result.stdout.split('\n'):
+            if 'ESSID:' in line:
+                ssid = line.split('ESSID:"')[1].split('"')[0]
+                if ssid and ssid not in networks:
+                    networks.append(ssid)
+        
+        if not networks:
+            networks = ["No networks found"]
+        
+        selected_index = 0
+        
+        # WiFi selection loop
+        while True:
+            # Display networks
+            display_draw.rectangle((0, 0, 800, 480), fill=255)
+            display_draw.text((10, 10), "WiFi Networks (arrows to select):", font=font24, fill=0)
+            
+            y = 60
+            for i, network in enumerate(networks[:10]):  # Show first 10
+                arrow = ">" if i == selected_index else " "
+                display_draw.text((10, y), f"{arrow} {network}", font=font24, fill=0)
+                y += linespacing
+            
+            display_draw.text((10, 450), "Enter=Connect | Esc=Cancel", font=font24, fill=0)
+            
+            partial_buffer = epd.getbuffer(display_image)
+            epd.display(partial_buffer)
+            
+            # Wait for key
+            key = keyboard.read_key()
+            
+            if key == "up":
+                selected_index = max(0, selected_index - 1)
+            elif key == "down":
+                selected_index = min(len(networks) - 1, selected_index + 1)
+            elif key == "enter":
+                if networks[selected_index] != "No networks found":
+                    # Show password prompt
+                    display_draw.rectangle((0, 0, 800, 480), fill=255)
+                    display_draw.text((10, 10), f"Network: {networks[selected_index]}", font=font24, fill=0)
+                    display_draw.text((10, 60), "Password:", font=font24, fill=0)
+                    
+                    password = ""
+                    cursor_y = 100
+                    
+                    # Password input loop
+                    while True:
+                        display_draw.rectangle((0, 100, 800, 480), fill=255)
+                        display_draw.text((10, cursor_y), password + "_", font=font24, fill=0)
+                        display_draw.text((10, 450), "Enter=Connect | Esc=Cancel", font=font24, fill=0)
+                        
+                        partial_buffer = epd.getbuffer(display_image)
+                        epd.display(partial_buffer)
+                        
+                        key = keyboard.read_key()
+                        
+                        if key == "enter":
+                            # Connect to WiFi
+                            display_draw.rectangle((0, 0, 800, 480), fill=255)
+                            display_draw.text((10, 200), "Connecting...", font=font24, fill=0)
+                            partial_buffer = epd.getbuffer(display_image)
+                            epd.display(partial_buffer)
+                            
+                            # Create wpa_supplicant config
+                            subprocess.run(['sudo', 'wpa_passphrase', networks[selected_index], password], 
+                                         stdout=open('/tmp/wpa_temp.conf', 'w'))
+                            subprocess.run(['sudo', 'wpa_cli', '-i', 'wlan0', 'reconfigure'])
+                            
+                            time.sleep(3)
+                            break
+                        elif key == "backspace":
+                            password = password[:-1]
+                        elif key == "esc":
+                            break
+                        elif len(key) == 1:
+                            password += key
+                    
+                break
+            elif key == "esc":
+                break
+        
+        # Re-hook keyboard
+        keyboard.on_press(handle_key_down, suppress=False)
+        keyboard.on_release(handle_key_press, suppress=True)
+        
+        needs_display_update = True
+
     #new file (clear) via ctrl + n
     if e.name== "n" and control_active: #ctrl+n
         #save the cache first
@@ -259,8 +370,8 @@ def handle_key_press(e):
     #powerdown - could add an autosleep if you want to save battery
     if e.name == "esc" and control_active: #ctrl+esc
         #run powerdown script
-        display_draw.rectangle((0, 0, 400, 300), fill=255)  # Clear display
-        display_draw.text((55, 150), "ZeroWriter Powered Down.", font=font24, fill=0)
+        display_draw.rectangle((0, 0, 800, 480), fill=255)  # Clear display
+        display_draw.text((200, 240), "ZeroWriter Powered Down.", font=font24, fill=0)
         partial_buffer = epd.getbuffer(display_image)
         epd.display(partial_buffer)
         time.sleep(3)
@@ -355,8 +466,6 @@ def handle_key_press(e):
         cursor_position = len(input_content)                
 
     typing_last_time = time.time()
-    input_catchup==True
-    needs_input_update = True
     
 def handle_interrupt(signal, frame):
     keyboard.unhook_all()
@@ -380,22 +489,31 @@ needs_input_update = False
 
 
 #mainloop
+last_refresh_time = time.time()
+REFRESH_INTERVAL = 0.25  # Minimum time between refreshes (250ms)
+
 try:
     while True:
         
         if exit_cleanup:
             break
-                
+        
+        current_time = time.time()
+        
+        # Only refresh if enough time has passed AND we need an update
+        if needs_input_update and (current_time - last_refresh_time) >= REFRESH_INTERVAL:
+            if scrollindex == 1:  # Only update input if we're on current page
+                update_input_area()
+                needs_input_update = False
+                last_refresh_time = current_time
+        
+        # Full display refresh (less frequent)
         if needs_display_update and not display_updating:
             update_display()
-            needs_diplay_update=False
-            typing_last_time = time.time()
-            
-        elif (time.time()-typing_last_time)<(.5): #if not doing a full refresh, do partials
-            #the screen enters a high refresh mode when there has been keyboard input
-            if not updating_input_area and scrollindex==1:
-                update_input_area()
-        #time.sleep(0.05) #the sleep here seems to help the processor handle things, especially on 64-bit installs
+            needs_display_update = False
+            last_refresh_time = current_time
+        
+        time.sleep(0.01)  # Small sleep to prevent CPU spinning
         
 except KeyboardInterrupt:
     pass
