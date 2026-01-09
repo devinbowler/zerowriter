@@ -1,5 +1,5 @@
 #
-# Writer - Full featured e-ink typewriter with non-blocking refresh
+# Mae's Writer - Full featured e-ink typewriter with non-blocking refresh
 #
 
 import time
@@ -61,10 +61,11 @@ MODE_FILESYSTEM = 2
 MODE_FS_NEW_FILE = 3
 MODE_FS_NEW_FOLDER = 4
 MODE_FS_DELETE = 5
-MODE_WIFI_LIST = 6
-MODE_WIFI_PASS = 7
-MODE_WIFI_RESULT = 8
-MODE_CLOUD_LOGIN = 9
+MODE_FS_RENAME = 6
+MODE_WIFI_LIST = 7
+MODE_WIFI_PASS = 8
+MODE_WIFI_RESULT = 9
+MODE_CLOUD_LOGIN = 10
 
 # ============================================================
 # STATE
@@ -73,6 +74,7 @@ current_mode = MODE_HOME
 
 # Editor state
 lines = [""]
+line_is_continuation = [False]  # True if line is continuation of previous (soft wrap)
 current_line = 0
 cursor_col = 0
 scroll_offset = 0
@@ -96,6 +98,7 @@ fs_page = 0
 FS_ITEMS_PER_PAGE = 9
 fs_modal_text = ""
 fs_delete_selection = 0
+came_from_filesystem = False  # Track if we entered typing from filesystem
 
 # WiFi state
 wifi_networks = []
@@ -152,10 +155,22 @@ def cloud_upload(file_path):
     if not token or not os.path.exists(file_path):
         return False, "Not logged in"
     try:
+        # Get the folder path for this file
+        try:
+            rel_path = os.path.relpath(file_path, FILES_DIR)
+            dir_part = os.path.dirname(rel_path)
+            if not dir_part or dir_part == '.':
+                folder_path = "/"
+            else:
+                folder_path = "/" + dir_part.replace(os.sep, "/")
+        except:
+            folder_path = "/"
+
         with open(file_path, 'rb') as f:
             files = {'file': (os.path.basename(file_path), f, 'text/plain')}
+            data = {'path': folder_path}
             headers = {'Authorization': f'Bearer {token}'}
-            response = requests.patch(f"{CLOUD_API_URL}/api/notes", files=files, headers=headers, timeout=15)
+            response = requests.patch(f"{CLOUD_API_URL}/api/notes", files=files, data=data, headers=headers, timeout=15)
         if response.status_code in [200, 201]:
             return True, "Synced!"
         elif response.status_code == 401:
@@ -166,41 +181,79 @@ def cloud_upload(file_path):
     except:
         return False, "Error"
 
+def cloud_delete_folder(folder_path):
+    """Delete a folder and all its contents from cloud"""
+    config = load_config()
+    token = config.get('auth_token')
+    if not token:
+        return False
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        response = requests.delete(
+            f"{CLOUD_API_URL}/api/folders",
+            params={'path': folder_path},
+            headers=headers,
+            timeout=15
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+def cloud_delete_file(title, folder_path):
+    """Delete a file from cloud by title and path"""
+    config = load_config()
+    token = config.get('auth_token')
+    if not token:
+        return False
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        response = requests.delete(
+            f"{CLOUD_API_URL}/api/notes/by-title",
+            params={'title': title, 'path': folder_path},
+            headers=headers,
+            timeout=15
+        )
+        return response.status_code == 200
+    except:
+        return False
+
 # ============================================================
 # WIFI FUNCTIONS
 # ============================================================
 def wifi_scan_networks():
     try:
+        # Use nmcli to scan
+        subprocess.run(['sudo', 'nmcli', 'device', 'wifi', 'rescan'], timeout=10, capture_output=True)
+        time.sleep(2)
         result = subprocess.run(
-            ['sudo', 'iw', 'dev', 'wlan0', 'scan'],
+            ['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list'],
             capture_output=True, text=True, timeout=15
         )
         nets = []
         for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("SSID:"):
-                ssid = line.split("SSID:", 1)[1].strip()
-                if ssid and ssid not in nets:
-                    nets.append(ssid)
+            ssid = line.strip()
+            if ssid and ssid not in nets:
+                nets.append(ssid)
         return nets if nets else ["No networks found"]
     except:
         return ["Scan error"]
 
 def wifi_try_connect(ssid, password):
     try:
-        tmp_conf = "/tmp/wpa_temp.conf"
-        with open(tmp_conf, "w") as f:
-            subprocess.run(['sudo', 'wpa_passphrase', ssid, password],
-                         stdout=f, text=True, timeout=8)
-        subprocess.run(['sudo', 'cp', tmp_conf, '/etc/wpa_supplicant/wpa_supplicant.conf'], timeout=5)
-        subprocess.run(['sudo', 'wpa_cli', '-i', 'wlan0', 'reconfigure'], timeout=8)
-        time.sleep(3)
-        st = subprocess.run(['sudo', 'wpa_cli', '-i', 'wlan0', 'status'],
-                           capture_output=True, text=True, timeout=5)
-        if "wpa_state=COMPLETED" in st.stdout:
+        # Use nmcli to connect
+        result = subprocess.run(
+            ['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid, 'password', password],
+            capture_output=True, text=True, timeout=30
+        )
+
+        if result.returncode == 0 and 'successfully' in result.stdout.lower():
             return True, "Connected!"
-        return False, "Failed to connect"
-    except:
+        else:
+            error_msg = result.stderr.strip() if result.stderr else "Failed"
+            return False, error_msg[:20] if len(error_msg) > 20 else error_msg
+    except subprocess.TimeoutExpired:
+        return False, "Timeout"
+    except Exception as e:
         return False, "Error"
 
 # ============================================================
@@ -263,9 +316,50 @@ def fs_delete_item(index):
     full_path = os.path.join(fs_get_full_path(), item['name'])
     try:
         if item['is_folder']:
+            # Delete from cloud first
+            cloud_folder_path = fs_get_display_path()
+            if cloud_folder_path == '/':
+                cloud_folder_path = '/' + item['name']
+            else:
+                cloud_folder_path = cloud_folder_path + '/' + item['name']
+            cloud_delete_folder(cloud_folder_path)
+            # Then delete locally
             shutil.rmtree(full_path)
         else:
+            # Delete file from cloud first
+            cloud_folder_path = fs_get_display_path()
+            file_name = item['name'].replace('.txt', '')
+            cloud_delete_file(file_name, cloud_folder_path)
+            # Then delete locally
             os.remove(full_path)
+        return True
+    except:
+        return False
+
+def fs_rename_item(index, new_name):
+    if index < 0 or index >= len(fs_items):
+        return False
+    if not new_name.strip():
+        return False
+
+    item = fs_items[index]
+    old_path = os.path.join(fs_get_full_path(), item['name'])
+
+    # For files, ensure .txt extension
+    if not item['is_folder'] and not new_name.endswith('.txt'):
+        new_name = new_name + '.txt'
+
+    new_path = os.path.join(fs_get_full_path(), new_name)
+
+    try:
+        # Rename locally
+        os.rename(old_path, new_path)
+
+        # For cloud, we'd need to update the note title
+        # This is complex, so for now just re-upload if it's a file
+        if not item['is_folder']:
+            cloud_upload(new_path)
+
         return True
     except:
         return False
@@ -273,6 +367,7 @@ def fs_delete_item(index):
 def fs_enter_item(index):
     global fs_current_path, fs_selected_index, fs_page, current_mode
     global current_file_path, lines, current_line, cursor_col, scroll_offset
+    global came_from_filesystem
 
     if index < 0 or index >= len(fs_items):
         return
@@ -288,6 +383,7 @@ def fs_enter_item(index):
     else:
         full_path = os.path.join(fs_get_full_path(), item['name'])
         load_document(full_path)
+        came_from_filesystem = True
         current_mode = MODE_TYPING
         trigger_refresh()
 
@@ -304,6 +400,28 @@ def fs_go_back():
 # ============================================================
 # FILE FUNCTIONS
 # ============================================================
+def get_content_for_save():
+    """Join lines, keeping only hard breaks (Enter key), not soft wraps"""
+    result = []
+    current_paragraph = ""
+
+    for i, line in enumerate(lines):
+        if i == 0 or not line_is_continuation[i]:
+            # This is a new paragraph (hard break before it)
+            if current_paragraph or i > 0:
+                result.append(current_paragraph)
+            current_paragraph = line
+        else:
+            # This is a continuation (soft wrap) - join with space
+            if current_paragraph and not current_paragraph.endswith(' '):
+                current_paragraph += ' '
+            current_paragraph += line
+
+    # Don't forget the last paragraph
+    result.append(current_paragraph)
+
+    return '\n'.join(result)
+
 def save_document():
     global console_message, current_file_path
 
@@ -312,8 +430,9 @@ def save_document():
         current_file_path = os.path.join(FILES_DIR, f"note_{timestamp}.txt")
 
     try:
+        content = get_content_for_save()
         with open(current_file_path, 'w') as f:
-            f.write('\n'.join(lines))
+            f.write(content)
         console_message = "[Saved]"
         trigger_refresh()
 
@@ -325,38 +444,83 @@ def save_document():
         trigger_refresh()
 
 def load_document(path):
-    global lines, current_line, cursor_col, scroll_offset, current_file_path
+    global lines, line_is_continuation, current_line, cursor_col, scroll_offset, current_file_path
 
     try:
         with open(path, 'r') as f:
             content = f.read()
-        lines = content.splitlines() if content else [""]
-        if not lines:
-            lines = [""]
+        raw_lines = content.splitlines() if content else [""]
+        if not raw_lines:
+            raw_lines = [""]
     except:
+        raw_lines = [""]
+
+    # Re-wrap long lines for display
+    lines = []
+    line_is_continuation = []
+
+    for raw_line in raw_lines:
+        if len(raw_line) <= CHARS_PER_LINE:
+            # Line fits, add as-is
+            lines.append(raw_line)
+            line_is_continuation.append(False if len(lines) == 1 or line_is_continuation[-1] == False else False)
+            # First line of each paragraph is not a continuation
+            if len(line_is_continuation) == 1:
+                line_is_continuation[0] = False
+            else:
+                line_is_continuation[-1] = False
+        else:
+            # Line needs wrapping
+            remaining = raw_line
+            first_chunk = True
+            while remaining:
+                if len(remaining) <= CHARS_PER_LINE:
+                    lines.append(remaining)
+                    line_is_continuation.append(not first_chunk)
+                    remaining = ""
+                else:
+                    # Find wrap point
+                    wrap_point = remaining.rfind(' ', 0, CHARS_PER_LINE)
+                    if wrap_point == -1:
+                        wrap_point = CHARS_PER_LINE
+
+                    lines.append(remaining[:wrap_point])
+                    line_is_continuation.append(not first_chunk)
+                    remaining = remaining[wrap_point:].lstrip()
+                    first_chunk = False
+
+    if not lines:
         lines = [""]
+        line_is_continuation = [False]
 
     current_file_path = path
-    current_line = 0
-    cursor_col = 0
-    scroll_offset = 0
+    # Position cursor at end of document
+    current_line = len(lines) - 1
+    cursor_col = len(lines[current_line])
+    # Scroll to show the cursor
+    if current_line >= VISIBLE_LINES:
+        scroll_offset = current_line - VISIBLE_LINES + 1
+    else:
+        scroll_offset = 0
 
 def load_cache():
-    global current_file_path
+    global current_file_path, lines, line_is_continuation, current_line, cursor_col, scroll_offset
     current_file_path = None
     if os.path.exists(CACHE_FILE):
         load_document(CACHE_FILE)
-        current_file_path = None
+        current_file_path = None  # Reset so it stays as cache
     else:
-        global lines, current_line, cursor_col
         lines = [""]
+        line_is_continuation = [False]
         current_line = 0
         cursor_col = 0
+        scroll_offset = 0
 
 def save_cache():
     try:
+        content = get_content_for_save()
         with open(CACHE_FILE, 'w') as f:
-            f.write('\n'.join(lines))
+            f.write(content)
     except:
         pass
 
@@ -485,7 +649,7 @@ def render_filesystem():
     display_draw.text((700, 10), f"Pg {fs_page + 1}/{total_pages}", font=font_small, fill=0)
 
     display_draw.line((0, 420, 800, 420), fill=0, width=2)
-    display_draw.text((10, 430), "^N:New File  ^G:New Folder  ^D:Delete", font=font_small, fill=0)
+    display_draw.text((10, 430), "^N:New  ^G:Folder  ^D:Del  ^J:Rename", font=font_small, fill=0)
     display_draw.text((10, 455), "Enter:Open  Bksp:Back  Esc:Home", font=font_small, fill=0)
 
 def render_fs_modal(title):
@@ -494,7 +658,20 @@ def render_fs_modal(title):
     display_draw.text((100, 170), title, font=font_main, fill=0)
     display_draw.rectangle((70, 220, 730, 280), outline=0, width=2)
     display_draw.text((80, 235), fs_modal_text + "_", font=font_main, fill=0)
-    display_draw.text((100, 295), "Enter=Create  Esc=Cancel", font=font_small, fill=0)
+    display_draw.text((100, 295), "Enter=Confirm  Esc=Cancel", font=font_small, fill=0)
+
+def render_fs_rename():
+    display_draw.rectangle((0, 0, 800, 480), fill=255)
+    display_draw.rectangle((50, 150, 750, 330), outline=0, width=3)
+
+    if fs_selected_index < len(fs_items):
+        item = fs_items[fs_selected_index]
+        item_type = "folder" if item['is_folder'] else "file"
+        display_draw.text((100, 170), f"Rename {item_type}:", font=font_main, fill=0)
+
+    display_draw.rectangle((70, 220, 730, 280), outline=0, width=2)
+    display_draw.text((80, 235), fs_modal_text + "_", font=font_main, fill=0)
+    display_draw.text((100, 295), "Enter=Rename  Esc=Cancel", font=font_small, fill=0)
 
 def render_fs_delete():
     display_draw.rectangle((0, 0, 800, 480), fill=255)
@@ -571,6 +748,8 @@ def do_render():
             render_fs_modal("New Folder Name:")
         elif current_mode == MODE_FS_DELETE:
             render_fs_delete()
+        elif current_mode == MODE_FS_RENAME:
+            render_fs_rename()
         elif current_mode in (MODE_WIFI_LIST, MODE_WIFI_PASS, MODE_WIFI_RESULT):
             render_wifi()
         elif current_mode == MODE_CLOUD_LOGIN:
@@ -606,13 +785,13 @@ def full_refresh_screen():
 # EDITOR FUNCTIONS
 # ============================================================
 def insert_char(char):
-    global lines, cursor_col, current_line
+    global lines, line_is_continuation, cursor_col, current_line
 
     line = lines[current_line]
     lines[current_line] = line[:cursor_col] + char + line[cursor_col:]
     cursor_col += 1
 
-    # Auto-wrap at 40 chars
+    # Auto-wrap at CHARS_PER_LINE chars
     if len(lines[current_line]) > CHARS_PER_LINE:
         line = lines[current_line]
         # Find last space before limit
@@ -626,6 +805,8 @@ def insert_char(char):
 
         lines[current_line] = before
         lines.insert(current_line + 1, after)
+        # Mark new line as continuation (soft wrap)
+        line_is_continuation.insert(current_line + 1, True)
 
         # Move cursor to new line if it was past wrap point
         if cursor_col > wrap_point:
@@ -637,7 +818,7 @@ def insert_char(char):
     trigger_refresh()
 
 def delete_char():
-    global lines, cursor_col, current_line
+    global lines, line_is_continuation, cursor_col, current_line
 
     if cursor_col > 0:
         line = lines[current_line]
@@ -649,12 +830,13 @@ def delete_char():
         cursor_col = len(prev_line)
         lines[current_line - 1] = prev_line + curr_line
         del lines[current_line]
+        del line_is_continuation[current_line]
         current_line -= 1
 
     trigger_refresh()
 
 def new_line():
-    global lines, current_line, cursor_col
+    global lines, line_is_continuation, current_line, cursor_col
 
     line = lines[current_line]
     left = line[:cursor_col]
@@ -662,6 +844,8 @@ def new_line():
 
     lines[current_line] = left
     lines.insert(current_line + 1, right)
+    # Mark as NOT a continuation (hard break from Enter key)
+    line_is_continuation.insert(current_line + 1, False)
     current_line += 1
     cursor_col = 0
 
@@ -839,11 +1023,44 @@ def handle_key_up(e):
             trigger_refresh()
         return
 
+    if current_mode == MODE_FS_RENAME:
+        if e.name == 'esc':
+            current_mode = MODE_FILESYSTEM
+            fs_modal_text = ""
+            trigger_refresh()
+        elif e.name == 'enter':
+            if fs_modal_text.strip():
+                fs_rename_item(fs_selected_index, fs_modal_text)
+                fs_load_items()
+            current_mode = MODE_FILESYSTEM
+            fs_modal_text = ""
+            trigger_refresh()
+        elif e.name == 'backspace':
+            fs_modal_text = fs_modal_text[:-1]
+            trigger_refresh()
+        elif e.name == 'space':
+            fs_modal_text += ' '
+            trigger_refresh()
+        elif len(e.name) == 1:
+            char = keymaps.shift_mapping.get(e.name, e.name.upper()) if shift_active else e.name
+            fs_modal_text += char
+            trigger_refresh()
+        return
+
     # ===== FILESYSTEM =====
     if current_mode == MODE_FILESYSTEM:
         if e.name == 'esc':
-            current_mode = MODE_HOME
-            full_refresh_screen()
+            if fs_current_path:
+                # Go back one folder
+                fs_current_path.pop()
+                fs_selected_index = 0
+                fs_page = 0
+                fs_load_items()
+                trigger_refresh()
+            else:
+                # At root, go to home
+                current_mode = MODE_HOME
+                full_refresh_screen()
         elif e.name == 'up':
             if fs_selected_index > 0:
                 fs_selected_index -= 1
@@ -871,6 +1088,15 @@ def handle_key_up(e):
         elif e.name == 'd' and ctrl_active and fs_items:
             current_mode = MODE_FS_DELETE
             fs_delete_selection = 0
+            trigger_refresh()
+        elif e.name == 'j' and ctrl_active and fs_items:
+            current_mode = MODE_FS_RENAME
+            # Pre-fill with current name (without .txt for files)
+            item = fs_items[fs_selected_index]
+            if item['is_folder']:
+                fs_modal_text = item['name']
+            else:
+                fs_modal_text = item['name'].replace('.txt', '')
             trigger_refresh()
         return
 
@@ -928,6 +1154,8 @@ def handle_key_up(e):
     # ===== HOME SCREEN =====
     if current_mode == MODE_HOME:
         if e.name == 'enter':
+            global came_from_filesystem
+            came_from_filesystem = False
             current_mode = MODE_TYPING
             load_cache()
             trigger_refresh()
@@ -951,10 +1179,21 @@ def handle_key_up(e):
             trigger_refresh()
         return
 
-    # ===== ESCAPE TO HOME =====
+    # ===== ESCAPE FROM TYPING =====
+    if e.name == 'esc' and current_mode == MODE_TYPING:
+        save_cache()
+        if came_from_filesystem:
+            # Go back to the folder containing this file
+            current_mode = MODE_FILESYSTEM
+            fs_load_items()
+            trigger_refresh()
+        else:
+            current_mode = MODE_HOME
+            full_refresh_screen()
+        return
+
+    # ===== ESCAPE TO HOME (other modes) =====
     if e.name == 'esc':
-        if current_mode == MODE_TYPING:
-            save_cache()
         current_mode = MODE_HOME
         full_refresh_screen()
         return
@@ -1035,3 +1274,5 @@ finally:
     epd.display(buf)
     time.sleep(1)
     epd.sleep()
+
+# i love you mae :))
